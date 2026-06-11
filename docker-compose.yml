@@ -1,0 +1,53 @@
+services:
+  ledger-db:
+    image: postgres:alpine
+    container_name: aegis_ledger_db
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${LEDGER_POSTGRES_USERNAME}
+      POSTGRES_PASSWORD: ${LEDGER_POSTGRES_PASSWORD}
+      POSTGRES_DB: aegis_ledger_db
+    volumes:
+      - aegis_ledger_data:/var/lib/postgresql/data
+    networks:
+      - aegis_net
+
+  gateway-cache:
+    image: redis:alpine
+    container_name: aegis_redis_cache
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - aegis_redis_data:/data
+    networks:
+      - aegis_net
+
+  message-broker:
+    image: rabbitmq:3-management-alpine
+    container_name: aegis_message_broker
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: ${AEGIS_RABBITMQ_USERNAME}
+      RABBITMQ_DEFAULT_PASS: ${AEGIS_RABBITMQ_PASSWORD}
+    volumes:
+      - aegis_rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - aegis_net
+
+networks:
+  aegis_net:
+    driver: bridge
+
+volumes:
+  aegis_ledger_data:
+    name: aegis_ledger_data
+  aegis_redis_data:
+    name: aegis_redis_data
+  aegis_rabbitmq_data:
+    name: aegis_rabbitmq_data
