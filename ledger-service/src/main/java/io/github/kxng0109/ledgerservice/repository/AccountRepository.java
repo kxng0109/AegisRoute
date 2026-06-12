@@ -16,9 +16,9 @@ import java.util.UUID;
 @Repository
 public interface AccountRepository extends JpaRepository<Account, UUID> {
     @Lock(LockModeType.PESSIMISTIC_WRITE)
-    @Query("select a from Account a where a.id = :accountId")
+    @Query("select a from Account a where a.userId = :userId")
     @QueryHints({
         @QueryHint(name = "jakarta.persistence.lock.timeout", value = "0") // NOWAIT - fail immediately if locked
     })
-    Optional<Account> findByIdForUpdate(@Param("accountId") UUID accountId);
+    Optional<Account> findByUserIdForUpdate(@Param("userId") String userId);
 }

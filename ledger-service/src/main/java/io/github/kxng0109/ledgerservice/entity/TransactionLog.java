@@ -44,9 +44,9 @@ public class TransactionLog {
 	@GeneratedValue(strategy = GenerationType.UUID)
 	private UUID id;
 
-	@ManyToOne
+	@ManyToOne(fetch = FetchType.LAZY)
 	@JoinColumn(name = "account_id", nullable = false)
-	private Account accountId;
+	private Account account;
 
 	@Enumerated(EnumType.STRING)
 	@Column(name = "operation_type", nullable = false)
