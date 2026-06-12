@@ -27,6 +27,7 @@
 
     <modules>
         <module>ledger-service</module>
+        <module>provider-simulator</module>
     </modules>
 
 </project>
