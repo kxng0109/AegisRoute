@@ -14,22 +14,30 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 
 /**
- * Service responsible for core ledger operations such as processing debit transactions.
- *
- * <ul>
- *   <li>Retrieves an account using a pessimistic write lock to guarantee exclusive
- *       access during balance updates.</li>
- *   <li>Creates {@link TransactionLog} entries that capture the outcome of each operation,
- *       enabling auditability and idempotency.</li>
- *   <li>Ensures that insufficient funds do not result in a negative balance; in such cases
- *       the transaction is recorded as {@link TransactionStatus#FAILED}.</li>
- *   <li>Relies on {@link AccountRepository} and {@link TransactionLogRepository} for
- *       persistence.</li>
- * </ul>
+ * Service component that encapsulates the core ledger operations for user accounts.
  * <p>
- * The service is designed to be used within a Spring transactional context; each public
- * method is annotated with {@code @Transactional} to guarantee atomicity of the read‑modify‑write
- * sequence.
+ * The service provides transactional methods to debit and credit accounts while
+ * maintaining a durable audit trail through {@link TransactionLog} entries.
+ * Pessimistic locking is employed when retrieving accounts to guarantee
+ * consistency under concurrent access. Each operation records its outcome with
+ * an appropriate {@link TransactionStatus} and {@link OperationType}.
+ * </p>
+ *
+ * <p>
+ * Dependencies:
+ * <ul>
+ *   <li>{@link TransactionLogRepository} – persists transaction logs.</li>
+ *   <li>{@link AccountRepository} – accesses and updates {@link Account} entities
+ *       with write locks.</li>
+ * </ul>
+ * </p>
+ *
+ * <p>
+ * All public methods are annotated with {@code @Transactional} to ensure that
+ * account updates and log persistence occur within a single atomic database
+ * transaction. Idempotency is supported via a caller‑supplied {@code idempotencyKey},
+ * allowing repeated requests to be safely ignored or reconciled.
+ * </p>
  */
 @Service
 @RequiredArgsConstructor
@@ -93,6 +101,51 @@ public class CoreLedgerService {
 		                                          .amount(amount)
 		                                          .referenceId(idempotencyKey)
 		                                          .status(TransactionStatus.SUCCESS)
+		                                          .build();
+
+		return transactionLogRepository.save(successLog);
+	}
+
+	/**
+	 * Credits the specified amount to a user's account.
+	 *
+	 * <p>This method retrieves the account identified by {@code userId} using a pessimistic
+	 * write lock to ensure exclusive access, adds the {@code amount} to the current balance,
+	 * persists the updated account, and creates a {@link TransactionLog} recording the credit
+	 * operation. The transaction log is saved and returned to the caller.</p>
+	 *
+	 * @param userId         the unique identifier of the user whose account will be credited
+	 * @param idempotencyKey a unique key used to guarantee idempotent processing of the credit
+	 * @param amount         the monetary amount to add to the user's balance; must be non‑negative
+	 * @return a {@link TransactionLog} representing the credit operation. The log records the
+	 * {@link OperationType#CREDIT} and has a status of {@link TransactionStatus#REVERSED}
+	 * as defined in the current implementation.
+	 */
+	@Transactional
+	public TransactionLog processCredit(
+			String userId,
+			String idempotencyKey,
+			BigDecimal amount
+	) {
+		// Acquire the database pessimistic lock
+		Account account = accountRepository.findByUserIdForUpdate(userId)
+		                                   .orElseThrow(
+				                                   () -> new AccountNotFoundException(
+						                                   "Account not found for ID: " + userId
+				                                   )
+		                                   );
+
+		BigDecimal newBalance = account.getBalance().add(amount);
+
+		account.setBalance(newBalance);
+		accountRepository.save(account);
+
+		TransactionLog successLog = TransactionLog.builder()
+		                                          .account(account)
+		                                          .operationType(OperationType.CREDIT)
+		                                          .amount(amount)
+		                                          .referenceId(idempotencyKey)
+		                                          .status(TransactionStatus.REVERSED)
 		                                          .build();
 
 		return transactionLogRepository.save(successLog);

@@ -1,10 +1,16 @@
 package io.github.kxng0109.ledgerservice.service;
 
 import io.github.kxng0109.ledgerservice.entity.TransactionLog;
+import io.github.kxng0109.ledgerservice.enums.TransactionStatus;
 import io.github.kxng0109.ledgerservice.exception.DuplicateTransactionException;
 import io.github.kxng0109.ledgerservice.repository.TransactionLogRepository;
+import io.github.kxng0109.ledgerservice.request.dto.CreditRequest;
 import io.github.kxng0109.ledgerservice.response.dto.DebitResponse;
+import io.github.kxng0109.ledgerservice.response.dto.RefundResponse;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
@@ -13,63 +19,56 @@ import java.time.Duration;
 import java.util.Optional;
 
 /**
- * Facade service that orchestrates debit operations ensuring idempotency and
- * concurrency safety.
- *
- * <p>This service delegates the core debit processing to {@link CoreLedgerService}
- * while managing idempotency keys and a Redis‑based lock. The workflow is:</p>
+ * Facade service that orchestrates ledger operations such as debits and credits while
+ * providing idempotency, concurrency control, and integration with messaging and
+ * persistence layers.
  *
  * <ul>
- *   <li>Check the {@link TransactionLogRepository} for an existing transaction
- *       with the supplied idempotency key.</li>
- *   <li>If found, return a {@link DebitResponse} built from the existing log.</li>
- *   <li>If not found, attempt to acquire a Redis lock uniquely identified by
- *       {@code "idempotency_lock:" + idempotencyKey}.</li>
- *   <li>If the lock cannot be obtained, throw {@link DuplicateTransactionException}
- *       indicating another request with the same key is in progress.</li>
- *   <li>When the lock is held, invoke {@link CoreLedgerService#processDebit(String, String, BigDecimal)}
- *       to create a new transaction.</li>
- *   <li>Transform the resulting {@link TransactionLog} into a {@link DebitResponse}
- *       and release the Redis lock in a {@code finally} block.</li>
+ *   <li>Debits are processed synchronously via {@link #handleDebit(String, String, BigDecimal)}.</li>
+ *   <li>Credits are consumed asynchronously from the {@code credit.queue} RabbitMQ queue
+ *       and handled by {@link #handleCredit(CreditRequest)}.</li>
+ *   <li>Redis locks prevent simultaneous processing of the same transaction for a given
+ *       user and idempotency key.</li>
+ *   <li>Transaction outcomes are persisted in {@link TransactionLogRepository} and
+ *       communicated through RabbitMQ using {@link #sendRefundResponse(RefundResponse)}.</li>
  * </ul>
  *
- * <p>All interactions are performed within the same Spring transaction context,
- * and the Redis lock is automatically cleaned up to prevent stale locks.</p>
+ * The service depends on the following collaborators:
+ * <ul>
+ *   <li>{@link StringRedisTemplate} – for acquiring and releasing distributed locks.</li>
+ *   <li>{@link TransactionLogRepository} – for looking up existing transaction logs.</li>
+ *   <li>{@link CoreLedgerService} – for the actual business logic of debit and credit
+ *       processing.</li>
+ *   <li>{@link RabbitTemplate} – for publishing refund responses.</li>
+ * </ul>
+ *
+ * All public methods are designed to be thread‑safe and to guarantee that a request
+ * identified by an {@code idempotencyKey} is processed at most once. If a duplicate
+ * request is detected, the previously recorded result is returned without re‑executing
+ * the core ledger operation.
  */
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class LedgerFacadeService {
 
 	private final StringRedisTemplate stringRedisTemplate;
 	private final TransactionLogRepository transactionLogRepository;
 	private final CoreLedgerService coreLedgerService;
+	private final RabbitTemplate rabbitTemplate;
 
 	/**
-	 * Processes a debit request for a specific user while ensuring idempotency.
+	 * Handles a debit request for a given user while ensuring idempotency and preventing
+	 * concurrent processing of the same transaction.
 	 *
-	 * <p>The method first checks if a transaction with the provided {@code idempotencyKey}
-	 * already exists in the database. If such a transaction is found, its corresponding
-	 * {@link DebitResponse} is returned immediately.</p>
-	 *
-	 * <p>If no existing transaction is found, the method attempts to acquire a Redis lock
-	 * identified by {@code "idempotency_lock:" + idempotencyKey}. Acquiring this lock
-	 * guarantees that concurrent requests with the same idempotency key are serialized.
-	 * If the lock cannot be obtained, a {@link DuplicateTransactionException} is thrown,
-	 * indicating that another request with the same key is currently being processed.</p>
-	 *
-	 * <p>Once the lock is obtained, the method delegates the actual debit operation to
-	 * {@link CoreLedgerService#processDebit(String, String, BigDecimal)}. The
-	 * resulting {@link TransactionLog} is transformed into a {@link DebitResponse}
-	 * using {@link #constructDebitResponse(TransactionLog)}. The Redis lock is released
-	 * in a {@code finally} block to ensure it is removed regardless of success or failure.</p>
-	 *
-	 * @param userId         the identifier of the user whose account will be debited; must not be {@code null}
-	 * @param idempotencyKey a unique key used to guarantee that the same debit request is not processed more than once; must not be {@code null}
-	 * @param amount         the monetary amount to debit; must be a positive {@link BigDecimal}; must not be {@code null}
-	 * @return a {@link DebitResponse} containing details of the processed debit transaction,
-	 * either retrieved from an existing log or created by the core ledger service
-	 * @throws DuplicateTransactionException if a transaction with the same {@code idempotencyKey}
-	 *                                       is already being processed
+	 * @param userId         the unique identifier of the user whose account is to be debited
+	 * @param idempotencyKey a unique key provided by the caller to guarantee that repeated
+	 *                       requests with the same key are processed only once
+	 * @param amount         the monetary amount to be debited from the user's account; must be a
+	 *                       non‑negative {@link BigDecimal}
+	 * @return a {@link DebitResponse} containing the result of the debit operation,
+	 * either retrieved from a previous transaction log or generated by processing
+	 * the debit through the core ledger service
 	 */
 	public DebitResponse handleDebit(
 			String userId,
@@ -83,7 +82,7 @@ public class LedgerFacadeService {
 			return constructDebitResponse(transactionLog.get());
 		}
 
-		String redisLockKey = "idempotency_lock:" + idempotencyKey;
+		String redisLockKey = "lock:debit:" + userId + ":" + idempotencyKey;
 
 		// Try and acquire the redis lock
 		Boolean lockAcquired = stringRedisTemplate.opsForValue().setIfAbsent(
@@ -115,6 +114,113 @@ public class LedgerFacadeService {
 			// but only after the coreLedgerService is done
 			stringRedisTemplate.delete(redisLockKey);
 		}
+	}
+
+	/**
+	 * Processes a credit request received from the {@code credit.queue} RabbitMQ queue.
+	 *
+	 * <p>The method performs the following steps:
+	 * <ul>
+	 *   <li>Checks the database for an existing {@link TransactionLog} using the request's idempotency key.
+	 *       If found, a {@link RefundResponse} based on the existing transaction is sent and processing ends.</li>
+	 *   <li>Attempts to acquire a Redis lock identified by the user ID and idempotency key to ensure
+	 *       that only one instance of the transaction is processed concurrently.</li>
+	 *   <li>If the lock cannot be obtained, a {@link DuplicateTransactionException} is thrown, indicating
+	 *       that the transaction is already in progress.</li>
+	 *   <li>When the lock is acquired, delegates the actual credit operation to {@code coreLedgerService.processCredit}.
+	 *       The resulting {@link TransactionLog} is used to build and send a {@link RefundResponse}.</li>
+	 *   <li>Regardless of success or failure, the Redis lock is released in a {@code finally} block.</li>
+	 *   <li>Any unexpected exception is caught, logged, and results in a {@link RefundResponse} with a
+	 *       {@link TransactionStatus#FAILED} status being sent.</li>
+	 * </ul>
+	 *
+	 * @param request the credit request containing the user identifier, idempotency key, and amount to be credited
+	 */
+	@RabbitListener(queues = "credit.queue")
+	public void handleCredit(
+			CreditRequest request
+	) {
+		try {
+			// check the db if the transaction log exists
+			Optional<TransactionLog> transactionLog = transactionLogRepository.findByReferenceId(
+					request.idempotencyKey()
+			);
+			// If it exists, then return it
+			if (transactionLog.isPresent()) {
+				TransactionLog txLog = transactionLog.get();
+
+				RefundResponse refundResponse = new RefundResponse(
+						txLog.getStatus().toString(),
+						txLog.getReferenceId(),
+						txLog.getAccount().getUserId()
+				);
+				sendRefundResponse(refundResponse);
+			}
+
+			String redisLockKey = "lock:credit:" + request.userId() + ":" + request.idempotencyKey();
+
+			// Try and acquire the redis lock
+			Boolean lockAcquired = stringRedisTemplate.opsForValue().setIfAbsent(
+					redisLockKey,
+					"LOCKED",
+					Duration.ofMinutes(1)
+			);
+
+			// IF we can't then that means the transaction is currently ongoing
+			if (Boolean.FALSE.equals(lockAcquired)) throw new DuplicateTransactionException(
+					"Transaction is currently processing. Please try again.",
+					request.idempotencyKey()
+			);
+
+			// We have obtained the redis lock
+			// wrapped in a try...finally block so that no matter what happens in the coreLedgerService,
+			// the redis lock gets deleted
+			try {
+				// let's call the coreLedgerService to handle the actual transaction
+				TransactionLog txLog = coreLedgerService.processCredit(
+						request.userId(),
+						request.idempotencyKey(),
+						request.amount()
+				);
+
+				RefundResponse refundResponse = new RefundResponse(
+						txLog.getStatus().toString(),
+						txLog.getReferenceId(),
+						txLog.getAccount().getUserId()
+				);
+				sendRefundResponse(refundResponse);
+			} finally {
+				// Redis lock gets deleted no matter what,
+				// but only after the coreLedgerService is done
+				stringRedisTemplate.delete(redisLockKey);
+			}
+		} catch (Exception e) {
+			log.error("An error occurred while processing credit request. {}", e.getMessage(), e);
+			sendRefundResponse(
+					new RefundResponse(
+							TransactionStatus.FAILED.toString(),
+							request.idempotencyKey(),
+							request.userId()
+					)
+			);
+		}
+	}
+
+	/**
+	 * Sends a {@code RefundResponse} message to the configured RabbitMQ exchange using the
+	 * predefined routing key. This method utilizes the {@code rabbitTemplate} to serialize the
+	 * {@code refundResponse} object and publish it to the {@code refund.response.exchange}
+	 * exchange, making it available for downstream consumers that are bound to the
+	 * {@code refund.response.routing.key} routing key.
+	 *
+	 * @param refundResponse the response containing refund details to be sent; must not be {@code null}
+	 */
+	private void sendRefundResponse(RefundResponse refundResponse) {
+		rabbitTemplate.convertAndSend(
+				"refund.response.exchange",
+				"refund.response.routing.key",
+				refundResponse
+		);
 	}
 
 	/**

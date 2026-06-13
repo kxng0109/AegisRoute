@@ -40,8 +40,8 @@ public class TransferSagaStates {
 	@Builder.Default
 	private TransactionStatus status = TransactionStatus.INITIATED;
 
-	@Column(name = "ledger_reference_id", nullable = false)
-	private UUID ledgerReferenceId;
+	@Column(name = "ledger_reference_id", nullable = false, unique = true)
+	private String ledgerReferenceId;
 
 	@CreationTimestamp
 	@Column(name = "created_at", nullable = false)
