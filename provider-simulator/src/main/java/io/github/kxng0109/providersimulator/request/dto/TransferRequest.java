@@ -8,9 +8,9 @@ import lombok.Builder;
 import java.math.BigDecimal;
 
 /**
- * Represents a request to transfer funds from a specific account.
+ * Represents a request to transfer funds to a specific account.
  *
- * <p>The request contains the account number and bank code identifying the source
+ * <p>The request contains the account number and bank code identifying the destination
  * account, together with the amount to be transferred. Validation constraints are
  * applied to ensure that all required fields are present and that the amount is
  * a positive decimal value with up to two fractional digits.</p>

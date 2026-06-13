@@ -13,9 +13,6 @@ public record SagaTransferRequest(
 		@NotBlank(message = "User ID is required!")
 		String userId,
 
-		@NotBlank(message = "Bank Code is required!")
-		String bankCode,
-
 		@NotBlank(message = "Destination Account is required!")
 		String destinationAccount,
 
