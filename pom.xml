@@ -28,6 +28,7 @@
     <modules>
         <module>ledger-service</module>
         <module>provider-simulator</module>
+        <module>orchestrator-service</module>
     </modules>
 
 </project>
