@@ -131,6 +131,7 @@ public class SagaOrchestratorService {
 			switch (errorStatusCode) {
 				case HttpStatus.SERVICE_UNAVAILABLE -> {
 					transferState.setStatus(TransactionStatus.PROVIDER_UNAVAILABLE);
+					sagaStatesRepository.save(transferState);
 					log.warn("Provider Unavailable: {}", e.getMessage(), e);
 
 					String refundIdempotencyKey = "refund-" + uuid;
