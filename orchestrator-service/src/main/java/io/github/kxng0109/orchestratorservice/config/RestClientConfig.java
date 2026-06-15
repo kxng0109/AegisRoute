@@ -1,5 +1,6 @@
 package io.github.kxng0109.orchestratorservice.config;
 
+import io.micrometer.observation.ObservationRegistry;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
@@ -8,51 +9,50 @@ import org.springframework.web.client.RestClient;
 import java.time.Duration;
 
 /**
- * Spring configuration class that defines {@link RestClient} beans for communicating
- * with external services.
+ * Spring configuration that creates {@link RestClient} beans for communication with
+ * external services used by the orchestrator.
  *
- * <p>This configuration creates two distinct {@code RestClient} instances, each
- * pre‑configured with a base URL and a custom {@link JdkClientHttpRequestFactory}
- * that sets an appropriate read timeout. The beans can be injected wherever a
- * {@code RestClient} is required to interact with the corresponding service.</p>
+ * <p>Two distinct {@code RestClient} instances are defined:</p>
  *
  * <ul>
- *   <li>{@code ledgerClient()} – targets the Ledger service located at
- *   {@code http://localhost:8082/api/v1} with a read timeout of 5 seconds.</li>
- *   <li>{@code providerClient()} – targets the Provider service located at
- *   {@code http://localhost:8081/api/v1} with a read timeout of 12 seconds.</li>
+ *   <li>{@code ledgerClient} – connects to the Ledger service located at
+ *   {@code http://localhost:8082/api/v1}. It uses a read timeout of 5 seconds.</li>
+ *   <li>{@code providerClient} – connects to the Provider service located at
+ *   {@code http://localhost:8081/api/v1}. It uses a read timeout of 12 seconds.</li>
  * </ul>
  *
- * <p>Both clients are built using {@link RestClient#builder()} and share the same
- * request factory implementation, differing only by their timeout configuration
- * and base URL. This separation allows fine‑grained control over the connection
- * characteristics for each external endpoint.</p>
+ * <p>Both clients share the same {@link ObservationRegistry} so that Micrometer
+ * observations (metrics, tracing, etc.) are automatically applied to outgoing HTTP
+ * requests. The {@link JdkClientHttpRequestFactory} is configured with an
+ * appropriate {@link Duration} read timeout for each client.</p>
  *
- * <p>The class is annotated with {@link Configuration} so that Spring's
- * component scanning registers the beans automatically during application startup.</p>
+ * <p>The beans are registered in the Spring application context and can be injected
+ * wherever a {@code RestClient} is required.</p>
  */
 @Configuration
 public class RestClientConfig {
 
 	@Bean
-	public RestClient ledgerClient(){
+	public RestClient ledgerClient(ObservationRegistry observationRegistry) {
 		JdkClientHttpRequestFactory factory = new JdkClientHttpRequestFactory();
 		factory.setReadTimeout(Duration.ofSeconds(5));
 
 		return RestClient.builder()
 		                 .baseUrl("http://localhost:8082/api/v1")
 		                 .requestFactory(factory)
+		                 .observationRegistry(observationRegistry)
 		                 .build();
 	}
 
 	@Bean
-	public RestClient providerClient() {
+	public RestClient providerClient(ObservationRegistry observationRegistry) {
 		JdkClientHttpRequestFactory factory = new JdkClientHttpRequestFactory();
 		factory.setReadTimeout(Duration.ofSeconds(12));
 
 		return RestClient.builder()
 		                 .baseUrl("http://localhost:8081/api/v1")
 		                 .requestFactory(factory)
+		                 .observationRegistry(observationRegistry)
 		                 .build();
 	}
 }

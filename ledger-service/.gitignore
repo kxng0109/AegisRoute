@@ -31,3 +31,4 @@ build/
 
 ### VS Code ###
 .vscode/
+/src/main/java/io/github/kxng0109/ledgerservice/seeder/DataSeeder.java

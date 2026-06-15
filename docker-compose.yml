@@ -55,6 +55,15 @@ services:
     networks:
       - aegis_net
 
+  zipkin:
+    image: openzipkin/zipkin:latest
+    container_name: aegis_tracing_zipkin
+    restart: unless-stopped
+    ports:
+      - "9411:9411"
+    networks:
+      - aegis_net
+
 networks:
   aegis_net:
     driver: bridge
