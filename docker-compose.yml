@@ -84,6 +84,30 @@ services:
     networks:
       - aegis_net
 
+  # The time-series database that receives the logs from Promtail and indexes them.
+  loki:
+    image: grafana/loki:latest
+    container_name: aegis_loki
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - aegis_net
+
+  # A lightweight background worker. Its only job is to watch those text files,
+  # read new lines as they are written, and ship them over the network.
+  promtail:
+    image: grafana/promtail:latest
+    container_name: aegis_promtail
+    restart: unless-stopped
+    volumes:
+      - ./promtail.yml:/etc/promtail/config.yml
+      - ./logs:/var/log/aegis
+    command: -config.file=/etc/promtail/config.yml
+    networks:
+      - aegis_net
+
 networks:
   aegis_net:
     driver: bridge

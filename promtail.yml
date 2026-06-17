@@ -1,0 +1,23 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  # This tells Promtail to remember exactly which line it read last,
+  # so if the container restarts, it doesn't duplicate logs.
+  filename: /tmp/positions.yaml
+
+clients:
+  # Ship the logs to the Loki service on our Docker network
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: aegis-microservices
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          # Tag the logs so we can filter them in Grafana
+          job: aegis-logs
+          # Tell Promtail exactly where to look for the text files
+          __path__: /var/log/aegis/**/*.log
