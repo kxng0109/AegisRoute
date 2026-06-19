@@ -1,12 +1,15 @@
 package io.github.kxng0109.ledgerservice.service;
 
+import io.github.kxng0109.ledgerservice.config.RabbitConfig;
 import io.github.kxng0109.ledgerservice.entity.TransactionLog;
+import io.github.kxng0109.ledgerservice.enums.OperationType;
 import io.github.kxng0109.ledgerservice.enums.TransactionStatus;
 import io.github.kxng0109.ledgerservice.exception.DuplicateTransactionException;
 import io.github.kxng0109.ledgerservice.repository.TransactionLogRepository;
 import io.github.kxng0109.ledgerservice.request.dto.CreditRequest;
 import io.github.kxng0109.ledgerservice.response.dto.DebitResponse;
 import io.github.kxng0109.ledgerservice.response.dto.RefundResponse;
+import io.micrometer.observation.annotation.Observed;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
@@ -19,33 +22,26 @@ import java.time.Duration;
 import java.util.Optional;
 
 /**
- * Facade service that orchestrates ledger operations such as debits and credits while
- * providing idempotency, concurrency control, and integration with messaging and
- * persistence layers.
+ * Facade service that coordinates ledger operations across persistence, caching,
+ * and messaging layers. It guarantees idempotent processing of debit and credit
+ * requests and protects against concurrent execution of the same logical
+ * transaction by using a Redis‑backed distributed lock.
  *
+ * <p>Typical usage patterns are:
  * <ul>
- *   <li>Debits are processed synchronously via {@link #handleDebit(String, String, BigDecimal)}.</li>
- *   <li>Credits are consumed asynchronously from the {@code credit.queue} RabbitMQ queue
- *       and handled by {@link #handleCredit(CreditRequest)}.</li>
- *   <li>Redis locks prevent simultaneous processing of the same transaction for a given
- *       user and idempotency key.</li>
- *   <li>Transaction outcomes are persisted in {@link TransactionLogRepository} and
- *       communicated through RabbitMQ using {@link #sendRefundResponse(RefundResponse)}.</li>
+ *   <li>Invoking {@link #handleDebit(String, String, BigDecimal)} from a
+ *       REST controller to debit a user's account.</li>
+ *   <li>Allowing Spring AMQP to invoke {@link #handleCredit(CreditRequest)} and
+ *       {@link #handleTimeoutRefund(CreditRequest)} as asynchronous message listeners.</li>
  * </ul>
  *
- * The service depends on the following collaborators:
- * <ul>
- *   <li>{@link StringRedisTemplate} – for acquiring and releasing distributed locks.</li>
- *   <li>{@link TransactionLogRepository} – for looking up existing transaction logs.</li>
- *   <li>{@link CoreLedgerService} – for the actual business logic of debit and credit
- *       processing.</li>
- *   <li>{@link RabbitTemplate} – for publishing refund responses.</li>
- * </ul>
+ * <p>All public methods are thread‑safe; the only mutable state is the transient
+ * Redis lock which is scoped to a specific {@code userId} and {@code idempotencyKey}.
  *
- * All public methods are designed to be thread‑safe and to guarantee that a request
- * identified by an {@code idempotencyKey} is processed at most once. If a duplicate
- * request is detected, the previously recorded result is returned without re‑executing
- * the core ledger operation.
+ * @see TransactionLogRepository
+ * @see CoreLedgerService
+ * @see StringRedisTemplate
+ * @see RabbitTemplate
  */
 @Service
 @RequiredArgsConstructor
@@ -56,6 +52,7 @@ public class LedgerFacadeService {
 	private final TransactionLogRepository transactionLogRepository;
 	private final CoreLedgerService coreLedgerService;
 	private final RabbitTemplate rabbitTemplate;
+	private final RabbitConfig rabbitConfig;
 
 	/**
 	 * Handles a debit request for a given user while ensuring idempotency and preventing
@@ -118,25 +115,38 @@ public class LedgerFacadeService {
 
 	/**
 	 * Processes a credit request received from the {@code credit.queue} RabbitMQ queue.
-	 *
-	 * <p>The method performs the following steps:
+	 * <p>
+	 * The method implements an idempotent workflow:
 	 * <ul>
-	 *   <li>Checks the database for an existing {@link TransactionLog} using the request's idempotency key.
-	 *       If found, a {@link RefundResponse} based on the existing transaction is sent and processing ends.</li>
-	 *   <li>Attempts to acquire a Redis lock identified by the user ID and idempotency key to ensure
-	 *       that only one instance of the transaction is processed concurrently.</li>
-	 *   <li>If the lock cannot be obtained, a {@link DuplicateTransactionException} is thrown, indicating
-	 *       that the transaction is already in progress.</li>
-	 *   <li>When the lock is acquired, delegates the actual credit operation to {@code coreLedgerService.processCredit}.
-	 *       The resulting {@link TransactionLog} is used to build and send a {@link RefundResponse}.</li>
-	 *   <li>Regardless of success or failure, the Redis lock is released in a {@code finally} block.</li>
-	 *   <li>Any unexpected exception is caught, logged, and results in a {@link RefundResponse} with a
-	 *       {@link TransactionStatus#FAILED} status being sent.</li>
+	 *   <li>First checks the {@link TransactionLogRepository} for an existing {@link TransactionLog}
+	 *       identified by {@code request.idempotencyKey()}. If found, a {@link RefundResponse}
+	 *       reflecting the stored status is sent back immediately.</li>
+	 *   <li>If no prior log exists, a Redis lock is acquired using a composite key
+	 *       {@code "lock:credit:" + request.userId() + ":" + request.idempotencyKey()}.
+	 *       The lock guarantees that concurrent consumers cannot process the same transaction
+	 *       simultaneously. The lock expires after one minute to avoid dead‑locks.</li>
+	 *   <li>When the lock is obtained, the request is handed to {@link CoreLedgerService#processCredit}
+	 *       which performs the actual ledger update and persists a new {@link TransactionLog}.</li>
+	 *   <li>Regardless of success or failure, the Redis lock is released in a {@code finally} block,
+	 *       ensuring no lock leakage.</li>
+	 *   <li>Any exception thrown during processing results in a {@link RefundResponse} with
+	 *       {@link TransactionStatus#FAILED} and is logged for diagnostics.</li>
 	 * </ul>
+	 * </p>
 	 *
-	 * @param request the credit request containing the user identifier, idempotency key, and amount to be credited
+	 * @param request the credit request payload; must be non‑null and contain a valid
+	 *                {@code userId}, {@code idempotencyKey}, and {@code amount}.
+	 * @throws DuplicateTransactionException if a lock cannot be obtained because another
+	 *                                       instance is already processing a transaction with the same
+	 *                                       {@code userId} and {@code idempotencyKey}.
+	 * @throws IllegalArgumentException      if {@code request} violates validation constraints
+	 *                                       such as a negative {@code amount}.
+	 * @see RefundResponse
+	 * @see TransactionLog
+	 * @see CoreLedgerService#processCredit(String, String, BigDecimal)
 	 */
 	@RabbitListener(queues = "credit.queue")
+	@Observed(name = "ledger.facade.handleCredit")
 	public void handleCredit(
 			CreditRequest request
 	) {
@@ -207,6 +217,65 @@ public class LedgerFacadeService {
 	}
 
 	/**
+	 * Processes a timeout notification for a refund operation received from the
+	 * {@code timeout.refund.response.queue} RabbitMQ queue.
+	 *
+	 * <p>The method first derives the original debit {@code referenceId} by
+	 * replacing the {@code "refund-ledger-timeout-"} prefix in the {@link CreditRequest#idempotencyKey()}
+	 * with {@code "transfer-"}. It then queries the {@link TransactionLogRepository}
+	 * for a {@link TransactionLog} whose {@code referenceId} matches the derived value
+	 * and whose {@code operationType} is {@link OperationType#DEBIT}. If such a debit
+	 * transaction exists, a compensating credit is issued via {@code handleCredit};
+	 * otherwise a {@link RefundResponse} with a {@link TransactionStatus#NOT_FOUND}
+	 * status is published.</p>
+	 *
+	 * <p>This method is invoked by Spring AMQP as a message listener; each
+	 * invocation is independent and the implementation does not maintain mutable
+	 * shared state, making it safe for concurrent execution provided that the
+	 * underlying {@code transactionLogRepository} and messaging infrastructure are
+	 * themselves thread‑safe.</p>
+	 *
+	 * @param request the refund timeout payload; must be non‑null and contain a
+	 *                valid {@code idempotencyKey} and {@code userId}
+	 */
+	@RabbitListener(queues = "timeout.refund.response.queue")
+	@Observed(name = "ledger.facade.handleTimeoutRefund")
+	public void handleTimeoutRefund(
+			CreditRequest request
+	) {
+
+		// We need to check if the debit was actually made
+		// We check to see if that referenceId exists
+		// We replace the "refund-ledger-timeout" we receive with "transfer" since it's what we use for debits
+		String referenceId = request.idempotencyKey().replace("refund-ledger-timeout-", "transfer-");
+
+		// Does a referenceId with type "DEBIT" exists?
+		Optional<TransactionLog> transactionLog = transactionLogRepository.findByReferenceIdAndOperationType(
+				referenceId,
+				OperationType.DEBIT
+		);
+
+		// It does? Then trigger a refund
+		if (transactionLog.isPresent()) {
+			rabbitTemplate.convertAndSend(
+					rabbitConfig.CREDIT_EXCHANGE_NAME,
+					rabbitConfig.CREDIT_ROUTING_KEY,
+					request
+			);
+			return;
+		}
+
+		// It doesn't? Then send a "NOT_FOUND" status refund response
+		sendRefundResponse(
+				RefundResponse.builder()
+				              .status(TransactionStatus.NOT_FOUND.toString())
+				              .referenceId(request.idempotencyKey())
+				              .userId(request.userId())
+				              .build()
+		);
+	}
+
+	/**
 	 * Sends a {@code RefundResponse} message to the configured RabbitMQ exchange using the
 	 * predefined routing key. This method utilizes the {@code rabbitTemplate} to serialize the
 	 * {@code refundResponse} object and publish it to the {@code refund.response.exchange}
@@ -217,8 +286,8 @@ public class LedgerFacadeService {
 	 */
 	private void sendRefundResponse(RefundResponse refundResponse) {
 		rabbitTemplate.convertAndSend(
-				"refund.response.exchange",
-				"refund.response.routing.key",
+				rabbitConfig.REFUND_RESPONSE_EXCHANGE_NAME,
+				rabbitConfig.REFUND_RESPONSE_ROUTING_KEY,
 				refundResponse
 		);
 	}

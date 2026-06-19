@@ -14,30 +14,19 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 
 /**
- * Service component that encapsulates the core ledger operations for user accounts.
+ * Service responsible for mutating {@link Account} balances and persisting
+ * corresponding {@link TransactionLog} entries.
  * <p>
- * The service provides transactional methods to debit and credit accounts while
- * maintaining a durable audit trail through {@link TransactionLog} entries.
- * Pessimistic locking is employed when retrieving accounts to guarantee
- * consistency under concurrent access. Each operation records its outcome with
- * an appropriate {@link TransactionStatus} and {@link OperationType}.
+ * The implementation follows a strict pessimistic‑locking strategy to avoid
+ * lost updates when multiple threads attempt to modify the same account
+ * concurrently. Each public method is wrapped in a Spring {@code @Transactional}
+ * context, guaranteeing atomicity between the balance change and the log
+ * insertion. If any unchecked exception propagates, the transaction is rolled
+ * back, leaving the account state unchanged.
  * </p>
  *
- * <p>
- * Dependencies:
- * <ul>
- *   <li>{@link TransactionLogRepository} – persists transaction logs.</li>
- *   <li>{@link AccountRepository} – accesses and updates {@link Account} entities
- *       with write locks.</li>
- * </ul>
- * </p>
- *
- * <p>
- * All public methods are annotated with {@code @Transactional} to ensure that
- * account updates and log persistence occur within a single atomic database
- * transaction. Idempotency is supported via a caller‑supplied {@code idempotencyKey},
- * allowing repeated requests to be safely ignored or reconciled.
- * </p>
+ * @see AccountRepository
+ * @see TransactionLogRepository
  */
 @Service
 @RequiredArgsConstructor
@@ -107,19 +96,31 @@ public class CoreLedgerService {
 	}
 
 	/**
-	 * Credits the specified amount to a user's account.
+	 * Credits the specified {@code amount} to the account identified by {@code userId}.
 	 *
-	 * <p>This method retrieves the account identified by {@code userId} using a pessimistic
-	 * write lock to ensure exclusive access, adds the {@code amount} to the current balance,
-	 * persists the updated account, and creates a {@link TransactionLog} recording the credit
-	 * operation. The transaction log is saved and returned to the caller.</p>
+	 * <p>The method obtains a pessimistic write lock on the {@link Account} row to
+	 * guarantee exclusive access during the balance update, thereby preventing
+	 * lost updates in a highly concurrent environment. After calculating the new
+	 * balance, the account record is persisted and a {@link TransactionLog}
+	 * entry reflecting the credit operation is created.</p>
 	 *
-	 * @param userId         the unique identifier of the user whose account will be credited
-	 * @param idempotencyKey a unique key used to guarantee idempotent processing of the credit
-	 * @param amount         the monetary amount to add to the user's balance; must be non‑negative
-	 * @return a {@link TransactionLog} representing the credit operation. The log records the
-	 * {@link OperationType#CREDIT} and has a status of {@link TransactionStatus#REVERSED}
-	 * as defined in the current implementation.
+	 * <p>Because the method participates in a Spring-managed transaction
+	 * (annotated with {@code @Transactional}), the account update and the log
+	 * insertion are committed atomically; any runtime exception will trigger a
+	 * rollback.</p>
+	 *
+	 * @param userId         the unique identifier of the user whose account will be credited;
+	 *                       must be non‑null and correspond to an existing {@link Account}
+	 * @param idempotencyKey a caller‑provided unique key used to achieve idempotent processing;
+	 *                       may be {@code null} if the caller does not require idempotency guarantees
+	 * @param amount         the monetary amount to add to the account balance; must be non‑null and non‑negative
+	 * @return a {@link TransactionLog} describing the outcome of the credit operation;
+	 * the log’s {@link TransactionLog#status status} is set to
+	 * {@link io.github.kxng0109.ledgerservice.enums.TransactionStatus#REVERSED} as defined by the current implementation
+	 * @throws IllegalArgumentException if {@code amount} is negative
+	 * @throws AccountNotFoundException if no {@link Account} exists for the supplied {@code userId}
+	 * @see OperationType#CREDIT
+	 * @see TransactionStatus
 	 */
 	@Transactional
 	public TransactionLog processCredit(

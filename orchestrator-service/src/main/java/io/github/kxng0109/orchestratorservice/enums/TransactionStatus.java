@@ -1,28 +1,31 @@
 package io.github.kxng0109.orchestratorservice.enums;
 
 /**
- * Represents the possible states of a transaction as it progresses through the saga
- * workflow. The values are stored in the {@code status} column of the
- * {@code transfer_saga_states} table and are updated by {@link io.github.kxng0109.orchestratorservice.service.SagaOrchestratorService}
- * as each step of the transfer is attempted.
+ * Represents the discrete lifecycle states of a cross‑system money transfer as it
+ * progresses through the orchestrator's saga workflow.
  *
- * <ul>
- *   <li>{@link #INITIATED} – The transaction has been created but no actions have been taken.</li>
- *   <li>{@link #LEDGER_DEBITED} – The user's ledger has been successfully debited.</li>
- *   <li>{@link #LEDGER_FAILED} – The attempt to debit the ledger failed.</li>
- *   <li>{@link #PROVIDER_COMPLETED} – The external provider completed the transfer.</li>
- *   <li>{@link #PROVIDER_UNAVAILABLE} – The provider service was unavailable (e.g., HTTP 503).</li>
- *   <li>{@link #PROVIDER_TIMEOUT} – The provider request timed out (e.g., HTTP 504).</li>
- *   <li>{@link #PROVIDER_FAILED} – The provider returned an error other than unavailable or timeout.</li>
- *   <li>{@link #REFUND_PENDING} – A refund has been requested but not yet processed.</li>
- *   <li>{@link #REFUND_COMPLETED} – The refund was successfully processed.</li>
- *   <li>{@link #REFUND_FAILED} – The refund attempt failed.</li>
- * </ul>
+ * <p>The values are persisted in {@link io.github.kxng0109.orchestratorservice.entity.TransferSagaStates}
+ * and drive decision‑making in the saga coordination components (e.g.
+ * {@link io.github.kxng0109.orchestratorservice.service.SagaResponseListener}). Each
+ * constant describes a mutually exclusive condition of the overall transaction,
+ * ranging from initial request acceptance to final settlement or failure.</p>
+ *
+ * <p>All states are stored as {@link jakarta.persistence.EnumType#STRING} in the
+ * database, which guarantees stable textual representation across deployments.
+ * No two {@link TransactionStatus} values are considered equal unless they are the
+ * same enum constant.</p>
+ *
+ * @see io.github.kxng0109.orchestratorservice.entity.TransferSagaStates
+ * @see io.github.kxng0109.orchestratorservice.service.SagaResponseListener
  */
 public enum TransactionStatus {
 	INITIATED,
 	LEDGER_DEBITED,
 	LEDGER_FAILED,
+	LEDGER_FAILED_CLEAN,
+	LEDGER_TIMEOUT,
+	LEDGER_TIMEOUT_REFUNDED,
+	LEDGER_TIMEOUT_RESOLVED,
 	PROVIDER_COMPLETED,
 	PROVIDER_UNAVAILABLE,
 	PROVIDER_TIMEOUT,
